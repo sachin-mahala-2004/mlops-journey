@@ -92,3 +92,5 @@ scores = {"alice": 80, "bob": 60, "charlie": 100}
 max_score = max(scores.values())
 dic = {k:v/100 for k,v in scores.items()}
 print(dic)
+
+
