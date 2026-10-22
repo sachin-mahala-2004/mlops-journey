@@ -4,7 +4,7 @@ This makes them testable and resuable: the caller decides the transaction bounda
 from decimal import Decimal
 from sqlalchemy.orm import Session, selectinload, joinedload
 from models import Course, Grade, Student, Prediction
-from sqlalchemy import select,func
+from sqlalchemy import select,func, update,delete
 
 #--------------------------------
 # CREATE
@@ -85,3 +85,120 @@ def students_without_grades(db:Session) -> list[Student]:
 
 def count_students(db:Session) -> int:
     return db.scalar(select(func.count()).select_from(Student)) or 0
+
+
+#--------------------------------------------------------------
+# UPDATE
+#--------------------------------------------------------------
+
+def update_student_major(db:Session, student_id:int, new_major:str) -> Student | None:
+    """ ORM style update : load, mutate , commit"""
+    student = db.get(Student,student_id)
+    if not student:
+        return None
+    student.major = new_major
+    db.commit()
+    db.refresh(student)
+    return student
+    # you don't write UPDATE, the session tracks which attributes of loaded objects changed and generates the statement on flush time.
+    # That mechanism is called One unit of work. 
+ 
+   
+def bump_grades_for_course(db:Session,course_id:int , delta:int) -> int:
+    stmt = (
+        update(Grade)
+        .where(Grade.course_id==course_id)
+        .values(grade = Grade.grade + delta)
+        .execution_options(synchronize_session="fetch")
+    )
+    
+    result = db.execute(stmt)
+    db.commit()
+    return result.rowcount 
+    
+
+#-------------------------------------
+# DELETE
+#-------------------------------------
+
+def delete_student(db:Session, student_id:int)-> bool:
+    student = db.get(Student,student_id)
+    if student is None:
+        return False
+    db.delete(student)
+    db.commit()
+    return True
+
+def delete_grades_for_student(db:Session,student_id:int) -> int:
+    """Bulk delete , doesn't run ORM cascades , database's FK does the work"""
+    stmt = (
+        delete(Grade).where(Grade.student_id == student_id)
+    )
+    result = db.execute(stmt)
+    db.commit()
+    return result.rowcount
+
+
+#-----------------------------------------------------------------------
+# TRANSACTIONS - two writes that must both suceed or both fail 
+#-----------------------------------------------------------------------
+
+def log_prediction_and_update_grade(db:Session, student_id:int, course_id:int, predicted:float, features:dict,
+                                    model_name:str = "grade-predictor", model_version:str = "v2") -> Prediction:
+    """ The transaction example that matters for MLOps . 
+    Writing the prediction log and updating the grade must be atomic. 
+    If one process dies between them you must not end up with a grade that no body can explain, 
+    and a prediction log for which no grade exists."""
+    
+    try: 
+        pred = Prediction(
+            model_name= model_name, model_version = model_version,
+            features = features, prediciton = predicted, confidence = 0.9
+        )
+        
+        db.add(pred)
+        
+        grade = db.scalar(
+            select(Grade).where(Grade.student_id == student_id, 
+                                Grade.course_id == course_id)).first()
+        
+        if grade is None:
+            raise ValueError(f"no grade with student id {student_id} and course id {course_id}")
+        
+        grade.grade = Decimal(str(round(predicted,2)))
+        
+        db.commit()
+        db.refresh(pred)
+        return pred
+    
+    except Exception:
+        db.rollback()
+        raise
+  
+    
+#-----------------------------------------------
+# JSONB - querying inside the features column
+#-----------------------------------------------
+
+def predicitons_by_major(db:Session,major:str) -> list[Prediction]:
+    stmt = select(Prediction).where(Prediction.features["major"].astext==major)
+    return list(db.scalar(stmt).all())
+
+def prediction_stats_by_verson(db:Session, model_name:str) :
+    """Compare two model versions. 
+    If v2's mean prediction has moved a lot from v1's mean predictions , 
+    it mean's something changed -- and we want to know that form a query not from customer complaint.
+    """
+    stmt =(
+        select(
+        Prediction,
+        func.count().label("n"),
+        func.avg(Prediction.prediction).label("mean_prediction"),
+        func.avg(Prediction.confidence).label("mean_confidence"),
+        func.percentile_cont(0.95).within_group(Prediction.latency).label("p95_latency_ms")
+        )
+        .where(Prediction.model_name == model_name)
+        .group_by(Prediction.model_version)
+        .order_by(Prediction.model_version)
+    )
+    return db.execute(stmt).all()
